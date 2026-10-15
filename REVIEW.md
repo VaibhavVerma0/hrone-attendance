@@ -1,9 +1,39 @@
 # REVIEW.md
 
-List every defect you found in the starter `app/main.py` (helpers and endpoints). For each one:
+Defects found in the starter `app/main.py`. Line numbers refer to the original starter file.
 
 | # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
 |---|---|---|---|---|
-| 1 | | | | |
+| 1 | `MongoClient(...)` (l.23) | Not `tz_aware`, so PyMongo returns naive datetimes. Any arithmetic with an aware IST value raises `TypeError`, and naive values are silently treated as local time. The default 30 s server-selection timeout also means `/health` hangs instead of failing. | `punch_in - shift_start_ist` raises "can't subtract offset-naive and offset-aware datetimes". | `tz_aware=True, tzinfo=UTC`, `serverSelectionTimeoutMS=3000`. |
+| 2 | `compute_late_minutes` (l.36) | Builds the shift start with `punch_in.replace(hour=..)`, which uses the punch's own time zone (UTC or server-local), not IST. | Shift 09:30, punch 09:45 IST (04:15 UTC): the start becomes 09:30 UTC, the punch is "before" the start, and late is 0 instead of 15. | Shift start is `datetime.combine(attendance_date, shift_start, tzinfo=IST)`. |
+| 3 | `compute_late_minutes` (l.38) | The grace check is on floored minutes (`minutes > 10`), not seconds. R2 says 09:40:01 is late. | 09:40:30 gives `int(10.5)=10`, `10 > 10` is false, so 0. Expected 10. | Late when `seconds > 600`; then `seconds // 60`. |
+| 4 | `compute_late_minutes` (l.36) | Overnight shifts: a punch-in after midnight is compared with today's 22:00 instead of yesterday's 22:00. | 22:00 shift, punch-in at 00:30 IST gives a negative difference, so 0. Expected 150. | Compute from the R1 attendance date (the previous day for this case). |
+| 5 | `compute_work_hours` (l.42) | `round()` on a float is neither half-up nor exact (R4). | 14418 s = 4.005 h, `round(4.005, 2)` = 4.0 (expected 4.01). 450 s = 0.125 h gives 0.12 (expected 0.13). | `Decimal(seconds) / 3600` quantized with `ROUND_HALF_UP`. |
+| 6 | `compute_overtime` (l.48) | No 30-minute minimum (R3). | Punch-out 18:35 for an 18:30 shift end gives 5. Expected 0. | Count only when the minutes are `>= 30`. |
+| 7 | `compute_overtime` (l.47) | Overnight shift end is placed on the same calendar date as the shift start. | 22:00-06:00 shift, out 06:40 next day gives ~1480 minutes instead of 40. | The shift end is on `date + 1 day` when `shift_end <= shift_start`. |
+| 8 | Helpers, all (l.34-48) | No truncation to whole seconds (R1). The stored and returned value keeps milliseconds. | `punched_at = ...:40:00.900` is stored with 900 ms, and the response is not a multiple of 1000. | `ms_to_dt` floors to seconds before anything is computed or stored. |
+| 9 | `EmployeeIn` (l.54) | No validation: `emp_code` pattern, email, `HH:MM` shift format, `joined_on` date, `shift_start != shift_end`, and string lengths. | `{"shift_start": "25:99"}` or `"joined_on": "yesterday"` returns 201, and later endpoints crash with a 500. | `Field` patterns and lengths, a `joined_on` validator, and a model validator for equal shifts. |
+| 10 | `create_employee` (l.80) | Check-then-insert with no unique index: two concurrent creates both succeed. | 10 parallel POSTs of the same `emp_code` give several 201s and duplicate rows. | Unique index on `emp_code`; insert and map `DuplicateKeyError` to 409. |
+| 11 | `create_employee` (l.83) | `created_at = datetime.now()`: naive server-local time stored as if it were UTC (off by the server's UTC offset), and returned as an ISO string instead of epoch ms. | On an IST server the stored instant is 5h30 off; the response field is a string. | `datetime.now(UTC)`; serialize with `dt_to_ms`. |
+| 12 | `list_employees` (l.94) | `skip = page * page_size` skips the first page. | `page=1` returns employees 21-40. | `(page - 1) * page_size`. |
+| 13 | `list_employees` (l.95) | `total` counts the whole collection, ignoring the `department` filter (R10). | `?department=Sales` gives `total=6` with 2 items. | `count_documents(q)`. |
+| 14 | `list_employees` (l.96) | No sort (the contract says `emp_code` ascending), so pages can overlap or skip rows. | The order follows insertion or disk order. | `.sort("emp_code", 1)`. |
+| 15 | `list_employees`, `list_attendance` (params) | `page` and `page_size` are not validated. | `page=0` gives a negative skip and a 500; `page_size=0` means "no limit"; `page_size=10000` is accepted. | `Query(ge=1)`, `page_size` 1-100, so out-of-range values return 422. |
+| 16 | `punch_in` (l.102) | An unknown employee gives `emp = None`, then `emp["shift_start"]`, which raises a `TypeError` and returns 500. | `POST /attendance/punch-in {"emp_code": "EMP9999"}` returns 500. Expected 404. | `get_employee()` raises 404. |
+| 17 | `PunchInIn` (l.66-67) | `punched_at: Optional[int]` accepts seconds, negative values and (in lax mode) floats or numeric strings. `status: str` accepts `ABSENT` or any text. | `punched_at=1783312500` (seconds) is stored as 1970; `"status": "LEAVE"` returns 201. | Strict int with a 1e11 to 4102444800000 range; `status` is `Literal["PRESENT","WFH","ON_DUTY"]`. |
+| 18 | `punch_in` (l.103) | `datetime.fromtimestamp()` uses the server's local zone, and the date is taken from that zone, not IST. The overnight rule is ignored. `if body.punched_at` also treats 0 as "now". | On a UTC server, 01:00 IST on the 7th gives date 2026-07-06. An overnight 00:30 punch-in gets the wrong day. | `ms_to_dt` (aware UTC) and `attendance_date()` per R1. |
+| 19 | `punch_in` (l.105) | Check-then-insert race: two simultaneous punch-ins both pass `find_one`, and both insert. | 20 parallel identical punch-ins give several 201s. | Unique index `(emp_code, date)`; insert and map `DuplicateKeyError` to 409. |
+| 20 | `punch_in` (l.120), `list_attendance` (l.150) | Leaks the internal `_id` as `id`, and returns datetimes instead of epoch ms. | The response has an `id` field and `"punch_in": "2026-07-06T..."`. | `record_out()`: no id, all instants (including inside `history.changes`) in epoch ms. |
+| 21 | `list_attendance` (l.145) | Loads every matching document into Python, then sorts and slices there. There is no index. | On 100k records: high latency and memory, and a COLLSCAN in explain. | Indexed `find().sort().skip().limit()` plus `count_documents`; indexes created at startup. |
+| 22 | `list_attendance` (l.146) | The sort has no `emp_code` tie-breaker (the contract says `date` desc, `emp_code` asc). | Rows on the same date come back in arbitrary order, so pages are unstable. | `sort([("date", -1), ("emp_code", 1)])`. |
+| 23 | `list_attendance` (params) | `date_from`/`date_to` are not validated, and `date_from > date_to` is not rejected. `status` is not validated. | `?date_from=07/01/2026` silently compares strings; `?status=SICK` returns 200 with nothing. | Date format and validity check, 422 when from > to, `status` is `Literal`. |
+| 24 | `list_attendance` / output | Legacy records without `half_day`/`history` are returned with those fields missing. | The sample legacy record (EMP0002, 2026-07-14) has no `history` key in the response. | `record_out()` fills defaults (`[]`, `false`, `0`). |
+| 25 | `health` (l.73) | Always returns 200, even when MongoDB is down. | Stop MongoDB, and `/health` still says ok. | `ping`, with 503 on failure. |
+| 26 | Module | No indexes are created at all, but the contract requires unique `emp_code` and race safety, and indexed list and analytics endpoints. | `GET /admin/explain/...` would show a COLLSCAN. | `ensure_indexes()` in the lifespan (idempotent), retried from `/health`. |
 
-Also note anything you looked at and decided was **not** a defect, and why.
+**Looked at and decided not a defect**
+- `load_dotenv()`: the default `override=False` means real environment variables already win over `.env`, which is what the contract asks for.
+- `IST = timezone(timedelta(hours=5, minutes=30))` is correct (IST has no DST).
+- `status_code=201` on create and punch-in matches the contract.
+- `compute_work_hours` working directly on `punch_out - punch_in` is fine once both values are aware and truncated, because only the rounding was wrong.
+- `doc.pop("_id")` after `insert_one` in `create_employee` was correct (insert mutates the dict); replaced only because the whole serialization moved to `employee_out()`.
